@@ -14,6 +14,9 @@ from log import log
 from .cache_manager import UnifiedCacheManager, CacheBackend
 
 
+_CACHE_MISSING = object()
+
+
 class RedisCacheBackend(CacheBackend):
     """Redis缓存后端实现"""
     
@@ -95,6 +98,8 @@ class RedisManager:
         # 写入配置参数
         self._write_delay = 1.0  # 写入延迟（秒）
         self._cache_ttl = 300  # 缓存TTL（秒）
+        self._legacy_migrated = False
+        self._legacy_migration_lock = asyncio.Lock()
     
     async def initialize(self):
         """初始化Redis连接"""
@@ -195,6 +200,100 @@ class RedisManager:
             "daily_limit_gemini_2_5_pro": 100,
             "daily_limit_total": 1000
         }
+
+    def _normalize_filename(self, filename: str) -> str:
+        if not filename:
+            return ""
+        return os.path.basename(filename)
+
+    def _ensure_entry_structure(self, entry: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        credential = {}
+        state: Dict[str, Any] = {}
+        stats: Dict[str, Any] = {}
+
+        if isinstance(entry, dict):
+            credential = entry.get("credential", {}) or {}
+            state = entry.get("state", {}) or {}
+            stats = entry.get("stats", {}) or {}
+
+        default_state = self._get_default_state()
+        merged_state = {**default_state, **state}
+        default_stats = self._get_default_stats()
+        merged_stats = {**default_stats, **stats}
+
+        return {
+            "credential": credential,
+            "state": merged_state,
+            "stats": merged_stats
+        }
+
+    def _merge_entries(self, base: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+        base_struct = self._ensure_entry_structure(base)
+        incoming_struct = self._ensure_entry_structure(incoming)
+
+        merged_state = {**base_struct["state"], **incoming_struct["state"]}
+        merged_stats = {**base_struct["stats"], **incoming_struct["stats"]}
+        merged_credential = incoming_struct["credential"] or base_struct["credential"]
+
+        return {
+            "credential": merged_credential,
+            "state": merged_state,
+            "stats": merged_stats
+        }
+
+    async def _ensure_legacy_migration(self):
+        if self._legacy_migrated:
+            return
+        async with self._legacy_migration_lock:
+            if self._legacy_migrated:
+                return
+            await self._migrate_legacy_keys()
+            self._legacy_migrated = True
+
+    async def _migrate_legacy_keys(self):
+        try:
+            all_data = await self._credentials_cache_manager.get_all()
+            updates: Dict[str, Dict[str, Any]] = {}
+            removals: set = set()
+
+            for key, entry in all_data.items():
+                normalized = self._normalize_filename(key)
+                if not normalized or normalized == key:
+                    continue
+
+                merged_entry = entry
+                if normalized in updates:
+                    merged_entry = self._merge_entries(updates[normalized], entry)
+                elif normalized in all_data:
+                    merged_entry = self._merge_entries(all_data[normalized], entry)
+
+                updates[normalized] = self._ensure_entry_structure(merged_entry)
+                removals.add(key)
+
+            if updates:
+                await self._credentials_cache_manager.update_multi(updates)
+            for key in removals:
+                await self._credentials_cache_manager.delete(key)
+
+            if removals:
+                log.debug(f"Migrated {len(removals)} legacy credential keys to normalized format")
+
+        except Exception as e:
+            log.error(f"Error migrating legacy credential keys: {e}")
+
+    async def _resolve_entry_key(self, filename: str) -> str:
+        normalized = self._normalize_filename(filename)
+
+        if normalized:
+            entry = await self._credentials_cache_manager.get(normalized, _CACHE_MISSING)
+            if entry is not _CACHE_MISSING:
+                return normalized
+
+        entry = await self._credentials_cache_manager.get(filename, _CACHE_MISSING)
+        if entry is not _CACHE_MISSING:
+            return filename
+
+        return normalized or filename
     
     # ============ 凭证管理 ============
     
@@ -204,23 +303,23 @@ class RedisManager:
         start_time = time.time()
         
         try:
-            # 获取现有数据或创建新数据
-            existing_data = await self._credentials_cache_manager.get(filename, {})
-            
-            credential_entry = {
-                "credential": credential_data,
-                "state": existing_data.get("state", self._get_default_state()),
-                "stats": existing_data.get("stats", self._get_default_stats())
-            }
-            
-            success = await self._credentials_cache_manager.set(filename, credential_entry)
+            await self._ensure_legacy_migration()
+            storage_key = self._normalize_filename(filename) or filename
+            if storage_key != filename:
+                await self._credentials_cache_manager.delete(filename)
+
+            existing_entry = await self._credentials_cache_manager.get(storage_key, _CACHE_MISSING)
+            structured_entry = self._ensure_entry_structure(None if existing_entry is _CACHE_MISSING else existing_entry)
+            structured_entry["credential"] = credential_data or {}
+
+            success = await self._credentials_cache_manager.set(storage_key, structured_entry)
             
             # 性能监控
             self._operation_count += 1
             operation_time = time.time() - start_time
             self._operation_times.append(operation_time)
             
-            log.debug(f"Stored credential to unified cache: {filename} in {operation_time:.3f}s")
+            log.debug(f"Stored credential to unified cache: {storage_key} in {operation_time:.3f}s")
             return success
                 
         except Exception as e:
@@ -234,14 +333,17 @@ class RedisManager:
         start_time = time.time()
         
         try:
-            credential_entry = await self._credentials_cache_manager.get(filename)
+            await self._ensure_legacy_migration()
+            storage_key = await self._resolve_entry_key(filename)
+            credential_entry = await self._credentials_cache_manager.get(storage_key, _CACHE_MISSING)
             
             # 性能监控
             self._operation_count += 1
             operation_time = time.time() - start_time
             self._operation_times.append(operation_time)
             
-            if credential_entry and "credential" in credential_entry:
+            if credential_entry is not _CACHE_MISSING and credential_entry and "credential" in credential_entry:
+                log.debug(f"Retrieved credential from unified cache: {storage_key} in {operation_time:.3f}s")
                 return credential_entry["credential"]
             return None
             
@@ -256,8 +358,14 @@ class RedisManager:
         start_time = time.time()
         
         try:
+            await self._ensure_legacy_migration()
             all_data = await self._credentials_cache_manager.get_all()
-            filenames = list(all_data.keys())
+            normalized_names = [self._normalize_filename(name) or name for name in all_data.keys()]
+            # 保持顺序同时去重
+            seen = {}
+            for name in normalized_names:
+                seen.setdefault(name, None)
+            filenames = list(seen.keys())
             
             # 性能监控
             self._operation_count += 1
@@ -278,14 +386,19 @@ class RedisManager:
         start_time = time.time()
         
         try:
-            success = await self._credentials_cache_manager.delete(filename)
+            await self._ensure_legacy_migration()
+            storage_key = await self._resolve_entry_key(filename)
+            success = await self._credentials_cache_manager.delete(storage_key)
+            if storage_key != filename:
+                legacy_deleted = await self._credentials_cache_manager.delete(filename)
+                success = success or legacy_deleted
             
             # 性能监控
             self._operation_count += 1
             operation_time = time.time() - start_time
             self._operation_times.append(operation_time)
             
-            log.debug(f"Deleted credential from unified cache: {filename} in {operation_time:.3f}s")
+            log.debug(f"Deleted credential from unified cache: {storage_key} in {operation_time:.3f}s")
             return success
                 
         except Exception as e:
@@ -301,27 +414,23 @@ class RedisManager:
         start_time = time.time()
         
         try:
-            # 获取现有数据或创建新数据
-            existing_data = await self._credentials_cache_manager.get(filename, {})
-            
-            if not existing_data:
-                existing_data = {
-                    "credential": {},
-                    "state": self._get_default_state(),
-                    "stats": self._get_default_stats()
-                }
-            
-            # 更新状态数据
-            existing_data["state"].update(state_updates)
-            
-            success = await self._credentials_cache_manager.set(filename, existing_data)
+            await self._ensure_legacy_migration()
+            storage_key = await self._resolve_entry_key(filename)
+            existing_entry = await self._credentials_cache_manager.get(storage_key, _CACHE_MISSING)
+            structured_entry = self._ensure_entry_structure(None if existing_entry is _CACHE_MISSING else existing_entry)
+            if state_updates:
+                structured_entry["state"].update(state_updates)
+
+            success = await self._credentials_cache_manager.set(storage_key, structured_entry)
+            if storage_key != filename:
+                await self._credentials_cache_manager.delete(filename)
             
             # 性能监控
             self._operation_count += 1
             operation_time = time.time() - start_time
             self._operation_times.append(operation_time)
             
-            log.debug(f"Updated credential state in unified cache: {filename} in {operation_time:.3f}s")
+            log.debug(f"Updated credential state in unified cache: {storage_key} in {operation_time:.3f}s")
             return success
                 
         except Exception as e:
@@ -335,15 +444,17 @@ class RedisManager:
         start_time = time.time()
         
         try:
-            credential_entry = await self._credentials_cache_manager.get(filename)
+            await self._ensure_legacy_migration()
+            storage_key = await self._resolve_entry_key(filename)
+            credential_entry = await self._credentials_cache_manager.get(storage_key, _CACHE_MISSING)
             
             # 性能监控
             self._operation_count += 1
             operation_time = time.time() - start_time
             self._operation_times.append(operation_time)
             
-            if credential_entry and "state" in credential_entry:
-                log.debug(f"Retrieved credential state from unified cache: {filename} in {operation_time:.3f}s")
+            if credential_entry is not _CACHE_MISSING and credential_entry and "state" in credential_entry:
+                log.debug(f"Retrieved credential state from unified cache: {storage_key} in {operation_time:.3f}s")
                 return credential_entry["state"]
             else:
                 # 返回默认状态
@@ -360,11 +471,14 @@ class RedisManager:
         start_time = time.time()
         
         try:
+            await self._ensure_legacy_migration()
             all_data = await self._credentials_cache_manager.get_all()
             
             states = {}
             for filename, cred_data in all_data.items():
-                states[filename] = cred_data.get("state", self._get_default_state())
+                normalized = self._normalize_filename(filename) or filename
+                entry_struct = self._ensure_entry_structure(cred_data)
+                states[normalized] = entry_struct.get("state", self._get_default_state())
             
             # 性能监控
             self._operation_count += 1
@@ -425,27 +539,23 @@ class RedisManager:
         start_time = time.time()
         
         try:
-            # 获取现有数据或创建新数据
-            existing_data = await self._credentials_cache_manager.get(filename, {})
+            await self._ensure_legacy_migration()
+            storage_key = await self._resolve_entry_key(filename)
+            existing_entry = await self._credentials_cache_manager.get(storage_key, _CACHE_MISSING)
+            structured_entry = self._ensure_entry_structure(None if existing_entry is _CACHE_MISSING else existing_entry)
+            if stats_updates:
+                structured_entry["stats"].update(stats_updates)
             
-            if not existing_data:
-                existing_data = {
-                    "credential": {},
-                    "state": self._get_default_state(),
-                    "stats": self._get_default_stats()
-                }
-            
-            # 更新统计数据
-            existing_data["stats"].update(stats_updates)
-            
-            success = await self._credentials_cache_manager.set(filename, existing_data)
+            success = await self._credentials_cache_manager.set(storage_key, structured_entry)
+            if storage_key != filename:
+                await self._credentials_cache_manager.delete(filename)
             
             # 性能监控
             self._operation_count += 1
             operation_time = time.time() - start_time
             self._operation_times.append(operation_time)
             
-            log.debug(f"Updated usage stats in unified cache: {filename} in {operation_time:.3f}s")
+            log.debug(f"Updated usage stats in unified cache: {storage_key} in {operation_time:.3f}s")
             return success
                 
         except Exception as e:
@@ -459,15 +569,17 @@ class RedisManager:
         start_time = time.time()
         
         try:
-            credential_entry = await self._credentials_cache_manager.get(filename)
+            await self._ensure_legacy_migration()
+            storage_key = await self._resolve_entry_key(filename)
+            credential_entry = await self._credentials_cache_manager.get(storage_key, _CACHE_MISSING)
             
             # 性能监控
             self._operation_count += 1
             operation_time = time.time() - start_time
             self._operation_times.append(operation_time)
             
-            if credential_entry and "stats" in credential_entry:
-                log.debug(f"Retrieved usage stats from unified cache: {filename} in {operation_time:.3f}s")
+            if credential_entry is not _CACHE_MISSING and credential_entry and "stats" in credential_entry:
+                log.debug(f"Retrieved usage stats from unified cache: {storage_key} in {operation_time:.3f}s")
                 return credential_entry["stats"]
             else:
                 return self._get_default_stats()
@@ -483,13 +595,15 @@ class RedisManager:
         start_time = time.time()
         
         try:
+            await self._ensure_legacy_migration()
             all_data = await self._credentials_cache_manager.get_all()
             
             stats = {}
             for filename, cred_data in all_data.items():
-                if "stats" in cred_data:
-                    stats[filename] = cred_data["stats"]
-            
+                normalized = self._normalize_filename(filename) or filename
+                entry_struct = self._ensure_entry_structure(cred_data)
+                stats[normalized] = entry_struct.get("stats", self._get_default_stats())
+
             # 性能监控
             self._operation_count += 1
             operation_time = time.time() - start_time

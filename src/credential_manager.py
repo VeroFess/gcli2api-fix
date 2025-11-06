@@ -105,16 +105,20 @@ class CredentialManager:
         while not self._shutdown_event.is_set():
             try:
                 # 每60秒检查一次凭证更新
-                await asyncio.wait_for(self._shutdown_event.wait(), timeout=60.0)
+                try:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=60.0)
+                except asyncio.TimeoutError:
+                    # 定时触发重新发现凭证
+                    await self._discover_credentials()
+                    continue
+
+                # 如果触发关闭事件则退出循环
                 if self._shutdown_event.is_set():
                     break
                 
-                # 重新发现凭证（热更新）
+                # 正常情况下也检查一次（例如外部提前触发事件时）
                 await self._discover_credentials()
                 
-            except asyncio.TimeoutError:
-                # 超时是正常的，继续下一轮
-                continue
             except Exception as e:
                 log.error(f"Background worker error: {e}")
                 await asyncio.sleep(5)  # 错误后等待5秒再继续

@@ -44,17 +44,17 @@ credential_manager = CredentialManager()
 # WebSocket连接管理
 
 class ConnectionManager:
-    def __init__(self, max_connections: int = 3):  # 进一步降低最大连接数
+    def __init__(self, max_connections: int = 10):  # 提高最大连接数以减少误拒绝
         # 使用双端队列严格限制内存使用
         self.active_connections: deque = deque(maxlen=max_connections)
         self.max_connections = max_connections
         self._last_cleanup = 0
-        self._cleanup_interval = 120  # 120秒清理一次死连接
+        self._cleanup_interval = 30  # 更频繁地清理死连接
 
     async def connect(self, websocket: WebSocket):
-        # 自动清理死连接
-        self._auto_cleanup()
-        
+        # 自动清理死连接（强制执行以避免占满连接数）
+        self._auto_cleanup(force=True)
+
         # 限制最大连接数，防止内存无限增长
         if len(self.active_connections) >= self.max_connections:
             await websocket.close(code=1008, reason="Too many connections")
@@ -71,6 +71,7 @@ class ConnectionManager:
             self.active_connections.remove(websocket)
         except ValueError:
             pass  # 连接已不存在
+        self.cleanup_dead_connections()
         log.debug(f"WebSocket连接断开，当前连接数: {len(self.active_connections)}")
 
     async def send_personal_message(self, message: str, websocket: WebSocket):
@@ -87,27 +88,34 @@ class ConnectionManager:
                 await conn.send_text(message)
             except Exception:
                 dead_connections.append(conn)
-        
+
         # 批量移除死连接
         for dead_conn in dead_connections:
             self.disconnect(dead_conn)
-                
-    def _auto_cleanup(self):
+        if dead_connections:
+            self.cleanup_dead_connections()
+
+    def _is_connection_alive(self, websocket: WebSocket) -> bool:
+        client_state = getattr(websocket, 'client_state', WebSocketState.DISCONNECTED)
+        app_state = getattr(websocket, 'application_state', WebSocketState.DISCONNECTED)
+        return client_state == WebSocketState.CONNECTED and app_state != WebSocketState.DISCONNECTED
+
+    def _auto_cleanup(self, force: bool = False):
         """自动清理死连接"""
         current_time = time.time()
-        if current_time - self._last_cleanup > self._cleanup_interval:
+        if force or current_time - self._last_cleanup > self._cleanup_interval:
             self.cleanup_dead_connections()
             self._last_cleanup = current_time
-    
+
     def cleanup_dead_connections(self):
         """清理已断开的连接"""
         original_count = len(self.active_connections)
         # 使用列表推导式过滤活跃连接，更高效
         alive_connections = deque([
             conn for conn in self.active_connections 
-            if hasattr(conn, 'client_state') and conn.client_state != WebSocketState.DISCONNECTED
+            if self._is_connection_alive(conn)
         ], maxlen=self.max_connections)
-        
+
         self.active_connections = alive_connections
         cleaned = original_count - len(self.active_connections)
         if cleaned > 0:
@@ -120,6 +128,49 @@ async def ensure_credential_manager_initialized():
     """确保credential manager已初始化"""
     if not credential_manager._initialized:
         await credential_manager.initialize()
+
+
+async def _resolve_credential_filename(storage_adapter, filename: str) -> Optional[str]:
+    """解析存储中实际存在的凭证文件名，兼容不同的存储后端命名"""
+    if not filename:
+        return None
+
+    candidate_names = []
+    basename = os.path.basename(filename)
+
+    # 优先尝试原始文件名
+    candidate_names.append(filename)
+    if basename and basename not in candidate_names:
+        candidate_names.append(basename)
+
+    # 直接尝试候选名称
+    for candidate in candidate_names:
+        try:
+            credential_data = await storage_adapter.get_credential(candidate)
+            if credential_data:
+                return candidate
+        except Exception as e:
+            log.debug(f"Credential lookup error for {candidate}: {e}")
+
+    # 回退到遍历所有凭证，按basename匹配
+    try:
+        all_names = await storage_adapter.list_credentials()
+    except Exception as e:
+        log.error(f"Failed to list credentials while resolving filename {filename}: {e}")
+        return None
+
+    # 先尝试精确匹配
+    if filename in all_names:
+        return filename
+    if basename in all_names:
+        return basename
+
+    # 再按basename匹配（考虑存储中可能包含路径）
+    for stored_name in all_names:
+        if os.path.basename(stored_name) == basename:
+            return stored_name
+
+    return None
 
 async def get_credential_manager():
     """获取全局凭证管理器实例"""
@@ -749,50 +800,61 @@ async def creds_action(request: CredFileActionRequest, token: str = Depends(veri
         
         log.info(f"Received request: {request}")
         
-        filename = request.filename
+        requested_filename = request.filename
         action = request.action
         
-        log.info(f"Performing action '{action}' on file: {filename}")
+        log.info(f"Performing action '{action}' on file: {requested_filename}")
         
         # 验证文件名
-        if not filename.endswith('.json'):
-            log.error(f"Invalid filename: {filename} (not a .json file)")
+        if not requested_filename.endswith('.json'):
+            log.error(f"Invalid filename: {requested_filename} (not a .json file)")
             raise HTTPException(status_code=400, detail=f"无效的文件名: {filename}")
         
         # 获取存储适配器
         storage_adapter = await get_storage_adapter()
+
+        # 尝试解析实际存在的文件名
+        resolved_filename = await _resolve_credential_filename(storage_adapter, requested_filename)
+        if not resolved_filename:
+            log.error(f"Credential not found: {requested_filename}")
+            raise HTTPException(status_code=404, detail="凭证文件不存在")
         
-        # 检查凭证是否存在
-        credential_data = await storage_adapter.get_credential(filename)
+        # 获取凭证数据（解析后文件名）
+        credential_data = await storage_adapter.get_credential(resolved_filename)
         if not credential_data:
-            log.error(f"Credential not found: {filename}")
+            log.error(f"Credential unexpectedly missing after resolution: {resolved_filename}")
             raise HTTPException(status_code=404, detail="凭证文件不存在")
         
         if action == "enable":
-            log.info(f"Web request: ENABLING file {filename}")
-            await credential_manager.set_cred_disabled(filename, False)
-            log.info(f"Web request: ENABLED file {filename} successfully")
-            return JSONResponse(content={"message": f"已启用凭证文件 {os.path.basename(filename)}"})
+            log.info(f"Web request: ENABLING file {resolved_filename}")
+            await credential_manager.set_cred_disabled(resolved_filename, False)
+            log.info(f"Web request: ENABLED file {resolved_filename} successfully")
+            return JSONResponse(content={"message": f"已启用凭证文件 {os.path.basename(resolved_filename)}"})
         
         elif action == "disable":
-            log.info(f"Web request: DISABLING file {filename}")
-            await credential_manager.set_cred_disabled(filename, True)
-            log.info(f"Web request: DISABLED file {filename} successfully")
-            return JSONResponse(content={"message": f"已禁用凭证文件 {os.path.basename(filename)}"})
+            log.info(f"Web request: DISABLING file {resolved_filename}")
+            await credential_manager.set_cred_disabled(resolved_filename, True)
+            log.info(f"Web request: DISABLED file {resolved_filename} successfully")
+            return JSONResponse(content={"message": f"已禁用凭证文件 {os.path.basename(resolved_filename)}"})
         
         elif action == "delete":
             try:
                 # 使用存储适配器删除凭证
-                success = await storage_adapter.delete_credential(filename)
+                success = await storage_adapter.delete_credential(resolved_filename)
+                if resolved_filename != requested_filename:
+                    await storage_adapter.delete_credential(requested_filename)
                 if success:
-                    log.info(f"Successfully deleted credential: {filename}")
-                    return JSONResponse(content={"message": f"已删除凭证文件 {os.path.basename(filename)}"})
-                else:
-                    raise HTTPException(status_code=500, detail="删除凭证失败")
+                    try:
+                        await credential_manager._discover_credentials()
+                    except Exception as refresh_error:
+                        log.debug(f"Refresh credentials after delete failed: {refresh_error}")
+                    log.info(f"Successfully deleted credential: {resolved_filename}")
+                    return JSONResponse(content={"message": f"已删除凭证文件 {os.path.basename(resolved_filename)}"})
+                raise HTTPException(status_code=500, detail="删除凭证失败")
             except Exception as e:
-                log.error(f"Error deleting credential {filename}: {e}")
+                log.error(f"Error deleting credential {resolved_filename}: {e}")
                 raise HTTPException(status_code=500, detail=f"删除文件失败: {str(e)}")
-        
+
         else:
             raise HTTPException(status_code=400, detail="无效的操作类型")
             
@@ -1735,4 +1797,3 @@ async def reset_usage_statistics(request: UsageResetRequest, token: str = Depend
     except Exception as e:
         log.error(f"重置使用统计失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-

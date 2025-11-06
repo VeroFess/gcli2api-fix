@@ -16,6 +16,9 @@ from log import log
 from .cache_manager import UnifiedCacheManager, CacheBackend
 
 
+_CACHE_MISSING = object()
+
+
 class PostgresCacheBackend(CacheBackend):
     """Postgres缓存后端，数据存储为key, data(JSONB), updated_at
     单行/单表设计：表名由管理器指定，每行以key区分。
@@ -87,6 +90,8 @@ class PostgresManager:
 
         self._write_delay = 1.0
         self._cache_ttl = 300
+        self._legacy_migrated = False
+        self._legacy_migration_lock = asyncio.Lock()
 
     async def initialize(self):
         async with self._lock:
@@ -163,21 +168,118 @@ class PostgresManager:
             'daily_limit_total': 1000
         }
 
+    def _normalize_filename(self, filename: str) -> str:
+        if not filename:
+            return ''
+        return os.path.basename(filename)
+
+    def _ensure_entry_structure(self, entry: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        credential = {}
+        state: Dict[str, Any] = {}
+        stats: Dict[str, Any] = {}
+
+        if isinstance(entry, dict):
+            credential = entry.get('credential', {}) or {}
+            state = entry.get('state', {}) or {}
+            stats = entry.get('stats', {}) or {}
+
+        default_state = self._get_default_state()
+        merged_state = {**default_state, **state}
+        default_stats = self._get_default_stats()
+        merged_stats = {**default_stats, **stats}
+
+        return {
+            'credential': credential,
+            'state': merged_state,
+            'stats': merged_stats
+        }
+
+    def _merge_entries(self, base: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+        base_struct = self._ensure_entry_structure(base)
+        incoming_struct = self._ensure_entry_structure(incoming)
+
+        merged_state = {**base_struct['state'], **incoming_struct['state']}
+        merged_stats = {**base_struct['stats'], **incoming_struct['stats']}
+        merged_credential = incoming_struct['credential'] or base_struct['credential']
+
+        return {
+            'credential': merged_credential,
+            'state': merged_state,
+            'stats': merged_stats
+        }
+
+    async def _ensure_legacy_migration(self):
+        if self._legacy_migrated:
+            return
+        async with self._legacy_migration_lock:
+            if self._legacy_migrated:
+                return
+            await self._migrate_legacy_keys()
+            self._legacy_migrated = True
+
+    async def _migrate_legacy_keys(self):
+        try:
+            all_data = await self._credentials_cache_manager.get_all()
+            updates: Dict[str, Dict[str, Any]] = {}
+            removals: set = set()
+
+            for key, entry in all_data.items():
+                normalized = self._normalize_filename(key)
+                if not normalized or normalized == key:
+                    continue
+
+                merged_entry = entry
+                if normalized in updates:
+                    merged_entry = self._merge_entries(updates[normalized], entry)
+                elif normalized in all_data:
+                    merged_entry = self._merge_entries(all_data[normalized], entry)
+
+                updates[normalized] = self._ensure_entry_structure(merged_entry)
+                removals.add(key)
+
+            if updates:
+                await self._credentials_cache_manager.update_multi(updates)
+            for key in removals:
+                await self._credentials_cache_manager.delete(key)
+
+            if removals:
+                log.debug(f'Migrated {len(removals)} legacy credential keys to normalized format (Postgres)')
+
+        except Exception as e:
+            log.error(f'Error migrating legacy credential keys (Postgres): {e}')
+
+    async def _resolve_entry_key(self, filename: str) -> str:
+        normalized = self._normalize_filename(filename)
+
+        if normalized:
+            entry = await self._credentials_cache_manager.get(normalized, _CACHE_MISSING)
+            if entry is not _CACHE_MISSING:
+                return normalized
+
+        entry = await self._credentials_cache_manager.get(filename, _CACHE_MISSING)
+        if entry is not _CACHE_MISSING:
+            return filename
+
+        return normalized or filename
+
     # 以下方法委托给 UnifiedCacheManager
     async def store_credential(self, filename: str, credential_data: Dict[str, Any]) -> bool:
         self._ensure_initialized()
         start_time = time.time()
         try:
-            existing_data = await self._credentials_cache_manager.get(filename, {})
-            credential_entry = {
-                'credential': credential_data,
-                'state': existing_data.get('state', self._get_default_state()),
-                'stats': existing_data.get('stats', self._get_default_stats())
-            }
-            success = await self._credentials_cache_manager.set(filename, credential_entry)
+            await self._ensure_legacy_migration()
+            storage_key = self._normalize_filename(filename) or filename
+            if storage_key != filename:
+                await self._credentials_cache_manager.delete(filename)
+
+            existing_entry = await self._credentials_cache_manager.get(storage_key, _CACHE_MISSING)
+            structured_entry = self._ensure_entry_structure(None if existing_entry is _CACHE_MISSING else existing_entry)
+            structured_entry['credential'] = credential_data or {}
+
+            success = await self._credentials_cache_manager.set(storage_key, structured_entry)
             self._operation_count += 1
             self._operation_times.append(time.time() - start_time)
-            log.debug(f'Stored credential to unified cache (postgres): {filename}')
+            log.debug(f'Stored credential to unified cache (postgres): {storage_key}')
             return success
         except Exception as e:
             log.error(f'Error storing credential {filename} in Postgres: {e}')
@@ -186,9 +288,11 @@ class PostgresManager:
     async def get_credential(self, filename: str) -> Optional[Dict[str, Any]]:
         self._ensure_initialized()
         try:
-            credential_entry = await self._credentials_cache_manager.get(filename)
+            await self._ensure_legacy_migration()
+            storage_key = await self._resolve_entry_key(filename)
+            credential_entry = await self._credentials_cache_manager.get(storage_key, _CACHE_MISSING)
             self._operation_count += 1
-            if credential_entry and 'credential' in credential_entry:
+            if credential_entry is not _CACHE_MISSING and credential_entry and 'credential' in credential_entry:
                 return credential_entry['credential']
             return None
         except Exception as e:
@@ -198,8 +302,13 @@ class PostgresManager:
     async def list_credentials(self) -> List[str]:
         self._ensure_initialized()
         try:
+            await self._ensure_legacy_migration()
             all_data = await self._credentials_cache_manager.get_all()
-            return list(all_data.keys())
+            normalized_names = [self._normalize_filename(name) or name for name in all_data.keys()]
+            seen = {}
+            for name in normalized_names:
+                seen.setdefault(name, None)
+            return list(seen.keys())
         except Exception as e:
             log.error(f'Error listing credentials from Postgres: {e}')
             return []
@@ -207,7 +316,13 @@ class PostgresManager:
     async def delete_credential(self, filename: str) -> bool:
         self._ensure_initialized()
         try:
-            return await self._credentials_cache_manager.delete(filename)
+            await self._ensure_legacy_migration()
+            storage_key = await self._resolve_entry_key(filename)
+            success = await self._credentials_cache_manager.delete(storage_key)
+            if storage_key != filename:
+                legacy_deleted = await self._credentials_cache_manager.delete(filename)
+                success = success or legacy_deleted
+            return success
         except Exception as e:
             log.error(f'Error deleting credential {filename} from Postgres: {e}')
             return False
@@ -215,11 +330,16 @@ class PostgresManager:
     async def update_credential_state(self, filename: str, state_updates: Dict[str, Any]) -> bool:
         self._ensure_initialized()
         try:
-            existing_data = await self._credentials_cache_manager.get(filename, {})
-            if not existing_data:
-                existing_data = {'credential': {}, 'state': self._get_default_state(), 'stats': self._get_default_stats()}
-            existing_data['state'].update(state_updates)
-            return await self._credentials_cache_manager.set(filename, existing_data)
+            await self._ensure_legacy_migration()
+            storage_key = await self._resolve_entry_key(filename)
+            existing_entry = await self._credentials_cache_manager.get(storage_key, _CACHE_MISSING)
+            structured_entry = self._ensure_entry_structure(None if existing_entry is _CACHE_MISSING else existing_entry)
+            if state_updates:
+                structured_entry['state'].update(state_updates)
+            result = await self._credentials_cache_manager.set(storage_key, structured_entry)
+            if storage_key != filename:
+                await self._credentials_cache_manager.delete(filename)
+            return result
         except Exception as e:
             log.error(f'Error updating credential state {filename} in Postgres: {e}')
             return False
@@ -227,8 +347,10 @@ class PostgresManager:
     async def get_credential_state(self, filename: str) -> Dict[str, Any]:
         self._ensure_initialized()
         try:
-            credential_entry = await self._credentials_cache_manager.get(filename)
-            if credential_entry and 'state' in credential_entry:
+            await self._ensure_legacy_migration()
+            storage_key = await self._resolve_entry_key(filename)
+            credential_entry = await self._credentials_cache_manager.get(storage_key, _CACHE_MISSING)
+            if credential_entry is not _CACHE_MISSING and credential_entry and 'state' in credential_entry:
                 return credential_entry['state']
             return self._get_default_state()
         except Exception as e:
@@ -238,8 +360,13 @@ class PostgresManager:
     async def get_all_credential_states(self) -> Dict[str, Dict[str, Any]]:
         self._ensure_initialized()
         try:
+            await self._ensure_legacy_migration()
             all_data = await self._credentials_cache_manager.get_all()
-            states = {fn: data.get('state', self._get_default_state()) for fn, data in all_data.items()}
+            states = {}
+            for fn, data in all_data.items():
+                normalized = self._normalize_filename(fn) or fn
+                entry_struct = self._ensure_entry_structure(data)
+                states[normalized] = entry_struct.get('state', self._get_default_state())
             return states
         except Exception as e:
             log.error(f'Error getting all credential states from Postgres: {e}')
@@ -264,11 +391,16 @@ class PostgresManager:
     async def update_usage_stats(self, filename: str, stats_updates: Dict[str, Any]) -> bool:
         self._ensure_initialized()
         try:
-            existing_data = await self._credentials_cache_manager.get(filename, {})
-            if not existing_data:
-                existing_data = {'credential': {}, 'state': self._get_default_state(), 'stats': self._get_default_stats()}
-            existing_data['stats'].update(stats_updates)
-            return await self._credentials_cache_manager.set(filename, existing_data)
+            await self._ensure_legacy_migration()
+            storage_key = await self._resolve_entry_key(filename)
+            existing_entry = await self._credentials_cache_manager.get(storage_key, _CACHE_MISSING)
+            structured_entry = self._ensure_entry_structure(None if existing_entry is _CACHE_MISSING else existing_entry)
+            if stats_updates:
+                structured_entry['stats'].update(stats_updates)
+            result = await self._credentials_cache_manager.set(storage_key, structured_entry)
+            if storage_key != filename:
+                await self._credentials_cache_manager.delete(filename)
+            return result
         except Exception as e:
             log.error(f'Error updating usage stats for {filename} in Postgres: {e}')
             return False
@@ -276,8 +408,10 @@ class PostgresManager:
     async def get_usage_stats(self, filename: str) -> Dict[str, Any]:
         self._ensure_initialized()
         try:
-            credential_entry = await self._credentials_cache_manager.get(filename)
-            if credential_entry and 'stats' in credential_entry:
+            await self._ensure_legacy_migration()
+            storage_key = await self._resolve_entry_key(filename)
+            credential_entry = await self._credentials_cache_manager.get(storage_key, _CACHE_MISSING)
+            if credential_entry is not _CACHE_MISSING and credential_entry and 'stats' in credential_entry:
                 return credential_entry['stats']
             return self._get_default_stats()
         except Exception as e:
@@ -287,10 +421,14 @@ class PostgresManager:
     async def get_all_usage_stats(self) -> Dict[str, Dict[str, Any]]:
         self._ensure_initialized()
         try:
+            await self._ensure_legacy_migration()
             all_data = await self._credentials_cache_manager.get_all()
-            stats = {fn: data.get('stats', self._get_default_stats()) for fn, data in all_data.items()}
+            stats = {}
+            for fn, data in all_data.items():
+                normalized = self._normalize_filename(fn) or fn
+                entry_struct = self._ensure_entry_structure(data)
+                stats[normalized] = entry_struct.get('stats', self._get_default_stats())
             return stats
         except Exception as e:
             log.error(f'Error getting all usage stats from Postgres: {e}')
             return {}
-

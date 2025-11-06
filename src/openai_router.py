@@ -129,7 +129,7 @@ async def chat_completions(
         log.error("当前无可用凭证，请去控制台获取")
         raise HTTPException(status_code=500, detail="当前无可用凭证，请去控制台获取")
     
-    current_file = credential_result
+    current_file, _ = credential_result
     log.debug(f"Using credential: {current_file}")
     
     # 增加调用计数

@@ -205,8 +205,19 @@ class UsageStats:
             # 严格控制缓存大小 - 超过限制时删除最旧的条目
             if len(self._stats_cache) >= self._max_cache_size:
                 # 删除最旧的统计数据（基于next_reset_time或没有该字段的）
-                oldest_key = min(self._stats_cache.keys(),
-                               key=lambda k: self._stats_cache[k].get('next_reset_time', ''))
+                def eviction_key(name: str) -> float:
+                    next_reset_str = self._stats_cache[name].get("next_reset_time")
+                    if not next_reset_str:
+                        return float("-inf")
+                    try:
+                        next_reset = datetime.fromisoformat(next_reset_str)
+                        if next_reset.tzinfo is None:
+                            next_reset = next_reset.replace(tzinfo=timezone.utc)
+                        return next_reset.timestamp()
+                    except (ValueError, TypeError):
+                        return float("-inf")
+
+                oldest_key = min(self._stats_cache.keys(), key=eviction_key)
                 del self._stats_cache[oldest_key]
                 self._cache_dirty = True
                 log.debug(f"Removed oldest usage stats cache entry: {oldest_key}")
